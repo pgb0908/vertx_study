@@ -1,0 +1,6 @@
+{
+  "routes": [
+    { "path": "/orders/*", "filters": ["logging", "auth", "echo"] },
+    { "path": "/public/*", "filters": ["logging", "echo"] }
+  ]
+}
