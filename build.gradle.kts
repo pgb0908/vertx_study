@@ -16,6 +16,7 @@ dependencies {
     implementation(platform("io.vertx:vertx-stack-depchain:$vertxVersion"))
     implementation("io.vertx:vertx-core")
     implementation("io.vertx:vertx-web")
+    implementation("io.vertx:vertx-auth-jwt")
 
     testImplementation(platform("org.junit:junit-bom:6.0.0"))
     testImplementation("org.junit.jupiter:junit-jupiter")
@@ -50,3 +51,14 @@ fun registerDayRunTask(day: Int) {
 
 registerDayRunTask(1)
 registerDayRunTask(2)
+registerDayRunTask(3)
+registerDayRunTask(4)
+registerDayRunTask(5)
+registerDayRunTask(6)
+
+tasks.register<JavaExec>("genDay5Token") {
+    group = "application"
+    description = "Print a JWT signed with day5's shared secret, for curl testing"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("org.example.gateway.day5.TokenGenerator")
+}

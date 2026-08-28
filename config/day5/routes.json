@@ -1,0 +1,6 @@
+{
+  "routes": [
+    { "path": "/orders/*", "filters": ["logging", "authJwt"], "upstreamGroup": "orders-service" },
+    { "path": "/public/*", "filters": ["logging"], "upstreamGroup": "orders-service" }
+  ]
+}
