@@ -6,7 +6,6 @@ import io.vertx.ext.web.Router;
 import io.vertx.ext.web.handler.BodyHandler;
 import org.example.gateway.day9.filter.GatewayFilter;
 import org.example.gateway.day9.filter.GatewayFilterAdapter;
-import org.example.gateway.day9.filter.RequestBodyFilter;
 import org.example.gateway.day9.filter.ResponseBodyFilter;
 import org.example.gateway.day9.filter.ratelimit.RateLimitFilter;
 import org.example.gateway.day9.proxy.ProxyHandlerFactory;
@@ -36,13 +35,14 @@ public final class GatewayRouterBuilder {
         for (GatewayRoute gr : routes) {
             Route route = router.route(gr.path());
 
-            // RequestBodyFilter가 하나라도 있으면 이 라우트에 한해서만 바디를 통째로
-            // 버퍼링한다(BodyHandler). 필터 하나하나가 아니라 라우트 단위 opt-in인 이유:
-            // ctx.request()의 바디 스트림은 한 번만 읽을 수 있어서, 필터마다 각자
-            // 버퍼링을 시도하면 두 번째 필터부터 "이미 소비된 스트림" 문제가 재발한다.
-            // BodyHandler가 한 번 채워두면 ctx.body()는 몇 번을 읽어도 안전하다.
-            boolean needsRequestBody = gr.filters().stream().anyMatch(f -> f instanceof RequestBodyFilter);
-            if (needsRequestBody) {
+            // improve-codebase-architecture 세션에서 합의: "이 라우트가 바디를 버퍼링하는지"는
+            // 이제 GatewayRoute.bufferedRequestBody() 하나가 유일한 진실 공급원이다. 여기서
+            // 한 번만 물어보고, 이 라우트 안의 모든 결정(BodyHandler 부착 여부,
+            // ProxyHandlerFactory에 전달)에 그대로 재사용한다 — 예전엔 여기서 instanceof로,
+            // ProxyHandlerFactory에서는 ctx.body().available()로 각자 다시 추측했는데, 그
+            // 불일치 때문에 실제로 NPE와 요청 hang 버그가 났었다.
+            boolean bufferedRequestBody = gr.bufferedRequestBody();
+            if (bufferedRequestBody) {
                 route.handler(BodyHandler.create());
             }
 
@@ -69,9 +69,9 @@ public final class GatewayRouterBuilder {
 
                 if (gr.circuitBreaker() != null) {
                     route.handler(proxyFactory.forResilientGroup(
-                        gr.upstreamGroup(), gr.circuitBreaker(), gr.maxRetries(), responseBodyFilters));
+                        gr.upstreamGroup(), gr.circuitBreaker(), gr.maxRetries(), responseBodyFilters, bufferedRequestBody));
                 } else {
-                    route.handler(proxyFactory.forGroup(gr.upstreamGroup(), responseBodyFilters));
+                    route.handler(proxyFactory.forGroup(gr.upstreamGroup(), responseBodyFilters, bufferedRequestBody));
                 }
             }
         }

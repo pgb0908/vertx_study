@@ -51,12 +51,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *
  * requestBodyBuffered 버그(실제로 겪은 것): 라우트에 RequestBodyFilter가 있으면
  * GatewayRouterBuilder가 그 앞에 BodyHandler를 붙여서 ctx.request() 스트림을 이미 다
- * 읽어버린다. 이 사실을 모르고 여기서도 습관적으로 clientRequest.send(ctx.request())로
+ * 읽어버린다. 처음엔 이 사실을 몰라서 여기서도 습관적으로 clientRequest.send(ctx.request())로
  * 스트리밍을 시도했더니, 이미 끝난 스트림이라 아무 데이터도 오지 않아 요청이 영원히
- * 응답을 못 받고 멈췄다(curl이 타임아웃날 때까지 hang). 그래서 이 라우트에서는
- * ctx.request()를 다시 스트리밍하지 않고, 이미 버퍼링된 ctx.body().buffer()를 그대로
- * 보낸다 — day7의 "이미 소비된 스트림" 버그와 같은 종류지만, 이번엔 BodyHandler가
- * 원인이라는 게 다르다.
+ * 응답을 못 받고 멈췄다(curl이 타임아웃날 때까지 hang).
+ *
+ * improve-codebase-architecture 세션에서 정리: 처음엔 여기서 ctx.body().available()로
+ * "BodyHandler가 실행됐는지"를 스스로 추측해서 고쳤는데, 이건 GatewayRouterBuilder가
+ * 이미 내린 결정(GatewayRoute.bufferedRequestBody())을 이 클래스가 다시 추측하는 셈이라
+ * 같은 사실이 두 곳에서 각자 계산되는 문제였다. 지금은 그 결정을 requestBodyBuffered
+ * 파라미터로 직접 전달받는다 — 이 클래스는 더 이상 BodyHandler가 뭔지, ctx.body()가
+ * 언제 채워지는지 몰라도 된다.
  */
 public final class ProxyHandlerFactory {
 
@@ -68,25 +72,22 @@ public final class ProxyHandlerFactory {
         this.client = vertx.createHttpClient();
     }
 
-    public Handler<RoutingContext> forGroup(UpstreamGroup group, List<ResponseBodyFilter> responseBodyFilters) {
+    public Handler<RoutingContext> forGroup(UpstreamGroup group, List<ResponseBodyFilter> responseBodyFilters,
+                                             boolean requestBodyBuffered) {
         return ctx -> {
-            // BodyHandler가 이미 이 라우트의 요청 바디를 버퍼링해뒀다면(RequestBodyFilter가
-            // 있는 라우트), ctx.request() 스트림은 더 이상 스트리밍할 데이터가 없다 — 그
-            // 버퍼를 그대로 재사용해야 한다. RequestBody.available()로 BodyHandler가 실행됐는지
-            // 판별한다.
-            boolean bodyAlreadyBuffered = ctx.body().available();
-            if (!bodyAlreadyBuffered) {
+            if (!requestBodyBuffered) {
                 ctx.request().pause();
             }
             // resilience 미설정 라우트: day6과 동일하게 breaker/재시도 없이 그냥 한 번만 시도.
-            forwardOnce(ctx, group, Promise.promise(), new AtomicBoolean(false), !bodyAlreadyBuffered, responseBodyFilters);
+            forwardOnce(ctx, group, Promise.promise(), new AtomicBoolean(false), !requestBodyBuffered, responseBodyFilters);
         };
     }
 
     public Handler<RoutingContext> forResilientGroup(UpstreamGroup group, CircuitBreaker breaker, int maxRetries,
-                                                       List<ResponseBodyFilter> responseBodyFilters) {
+                                                       List<ResponseBodyFilter> responseBodyFilters,
+                                                       boolean requestBodyBuffered) {
         return ctx -> {
-            if (!ctx.body().available()) {
+            if (!requestBodyBuffered) {
                 ctx.request().pause();
             }
             AtomicBoolean responded = new AtomicBoolean(false);
@@ -130,9 +131,9 @@ public final class ProxyHandlerFactory {
                 if (streamBody) {
                     return clientRequest.send(ctx.request());
                 }
-                // bodyAlreadyBuffered인 라우트는 ctx.body().buffer()(BodyHandler가 채워둔 것)를
-                // 그대로 보낸다 — 재시도 경로(streamBody=false, 바디 없음)와 구분하기 위해
-                // 버퍼가 비어있지 않을 때만 명시적으로 실어보낸다.
+                // streamBody=false인 나머지 두 경우(요청 바디가 버퍼링된 라우트, 재시도 경로의
+                // 바디 없는 GET 등)를 여기서 같이 처리한다. ctx.body().buffer()는 버퍼링된
+                // 라우트가 바디 없는 요청(예: GET)일 때도 null일 수 있어 여전히 가드가 필요하다.
                 Buffer buffered = ctx.body().buffer();
                 return buffered != null && buffered.length() > 0 ? clientRequest.send(buffered) : clientRequest.send();
             })

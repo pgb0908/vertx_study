@@ -2,6 +2,7 @@ package org.example.gateway.day9.routing;
 
 import io.vertx.circuitbreaker.CircuitBreaker;
 import org.example.gateway.day9.filter.GatewayFilter;
+import org.example.gateway.day9.filter.RequestBodyFilter;
 import org.example.gateway.day9.proxy.UpstreamGroup;
 import org.example.gateway.day9.filter.ratelimit.RateLimiter;
 
@@ -23,4 +24,15 @@ public record GatewayRoute(
     int maxRetries,
     UpstreamGroup upstreamGroup
 ) {
+    /**
+     * improve-codebase-architecture 세션에서 합의된 단일 진실 공급원. 이전에는 "이 라우트가
+     * 요청 바디를 버퍼링하는지"를 GatewayRouterBuilder(instanceof 체크)와
+     * ProxyHandlerFactory(ctx.body().available() 추측)가 각자 따로 판단했는데, 그 불일치
+     * 때문에 실제로 NPE와 요청 hang 버그를 겪었다. filters()만 보고 결정되는 순수한
+     * 사실이라 GatewayRoute의 파생 메서드로 두고, 저장 필드로 따로 두지 않는다 — filters()와
+     * 어긋날 수 있는 "두 번째 진실"을 만들지 않기 위해서다.
+     */
+    public boolean bufferedRequestBody() {
+        return filters.stream().anyMatch(f -> f instanceof RequestBodyFilter);
+    }
 }
