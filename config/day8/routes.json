@@ -1,0 +1,9 @@
+{
+  "routes": [
+    { "path": "/orders/*", "filters": ["logging", "authJwt"], "upstreamGroup": "orders-service" },
+    { "path": "/public/*", "filters": ["logging"], "upstreamGroup": "orders-service",
+      "rateLimit": { "requestsPerSecond": 1, "burstSize": 2 } },
+    { "path": "/resilient/*", "filters": ["logging"], "upstreamGroup": "orders-service",
+      "resilience": { "maxFailures": 2, "timeoutMs": 500, "resetTimeoutMs": 3000, "maxRetries": 2 } }
+  ]
+}
