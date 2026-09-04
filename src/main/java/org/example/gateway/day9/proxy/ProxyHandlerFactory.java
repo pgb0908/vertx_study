@@ -10,13 +10,11 @@ import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpClient;
 import io.vertx.core.http.HttpClientResponse;
-import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.RequestOptions;
 import io.vertx.ext.web.RoutingContext;
 import org.example.gateway.day9.filter.ResponseBodyFilter;
 
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -64,8 +62,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class ProxyHandlerFactory {
 
-    private static final Set<HttpMethod> IDEMPOTENT_METHODS = Set.of(HttpMethod.GET, HttpMethod.HEAD, HttpMethod.OPTIONS);
-
     private final HttpClient client;
 
     public ProxyHandlerFactory(Vertx vertx) {
@@ -91,7 +87,7 @@ public final class ProxyHandlerFactory {
                 ctx.request().pause();
             }
             AtomicBoolean responded = new AtomicBoolean(false);
-            int retriesLeft = IDEMPOTENT_METHODS.contains(ctx.request().method()) ? maxRetries : 0;
+            int retriesLeft = RetryPolicy.initialRetriesLeft(ctx.request().method(), maxRetries);
             attempt(ctx, group, breaker, retriesLeft, responded, responseBodyFilters);
         };
     }
@@ -106,8 +102,7 @@ public final class ProxyHandlerFactory {
                 if (responded.get()) {
                     return; // 이미 업스트림 응답 헤더를 흘려보내기 시작한 뒤의 실패 — 되돌릴 수 없다.
                 }
-                boolean retryable = retriesLeft > 0 && !(err instanceof OpenCircuitException);
-                if (retryable) {
+                if (RetryPolicy.shouldRetry(retriesLeft, err)) {
                     attempt(ctx, group, breaker, retriesLeft - 1, responded, responseBodyFilters);
                 } else if (responded.compareAndSet(false, true)) {
                     respondError(ctx, err);
@@ -141,7 +136,7 @@ public final class ProxyHandlerFactory {
                 // 재시도 경로(!streamBody)에서는 5xx도 breaker 입장에서 "실패"로 취급한다.
                 // 안 그러면 업스트림이 계속 500만 내려줘도 breaker는 계속 CLOSED로 남아
                 // "매번 성공적으로 500을 전달"한 셈이 되어, 회로차단기가 무용지물이 된다.
-                if (!streamBody && clientResponse.statusCode() >= 500) {
+                if (!streamBody && RetryPolicy.isUpstreamFailure(clientResponse.statusCode())) {
                     clientResponse.body(); // 응답 바디를 드레인해서 커넥션을 풀에 정상 반납
                     promise.tryFail(new RuntimeException("upstream returned " + clientResponse.statusCode()));
                     return;
