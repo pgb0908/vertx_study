@@ -42,19 +42,22 @@ public final class VertxGatewayServer {
     }
 
     private void handle(HttpServerRequest request) {
+        System.out.println("[server] <- " + request.method() + " " + request.path());
         if (!request.path().equals(route.path())) {
-            System.out.println("[unmatched] " + request.method() + " " + request.path());
+            System.out.println("[server] no route matches " + request.path() + " -> 404");
             request.response().setStatusCode(404).end("no route matched");
             return;
         }
+        System.out.println("[server] matched route " + route.path() + " -> adapting HttpServerRequest to GatewayRequest");
 
         GatewayExchange exchange = new GatewayExchange(VertxRequestAdapter.adapt(request), route);
         engine.execute(exchange).whenComplete((response, err) -> {
             if (err != null) {
-                System.out.println("[unhandled] " + request.method() + " " + request.path() + " -> " + err);
+                System.out.println("[server] engine failed for " + request.method() + " " + request.path() + " -> " + err);
                 request.response().setStatusCode(502).end("upstream error: " + err.getMessage());
                 return;
             }
+            System.out.println("[server] -> writing status=" + response.statusCode() + " back to client");
             VertxResponseWriter.write(request.response(), response);
         });
     }

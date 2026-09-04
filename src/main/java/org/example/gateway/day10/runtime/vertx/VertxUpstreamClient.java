@@ -32,6 +32,8 @@ public final class VertxUpstreamClient implements UpstreamClient {
 
     @Override
     public CompletableFuture<GatewayResponse> execute(Endpoint endpoint, GatewayRequest request) {
+        System.out.println("[upstream] connecting to " + endpoint.host() + ":" + endpoint.port()
+            + " for " + request.method() + " " + request.uri());
         RequestOptions options = new RequestOptions()
             .setHost(endpoint.host())
             .setPort(endpoint.port())
@@ -41,8 +43,14 @@ public final class VertxUpstreamClient implements UpstreamClient {
         CompletableFuture<GatewayResponse> result = new CompletableFuture<>();
 
         client.request(options)
-            .onFailure(result::completeExceptionally)
-            .onSuccess(clientRequest -> forward(clientRequest, request, result));
+            .onFailure(err -> {
+                System.out.println("[upstream] connection failed: " + err);
+                result.completeExceptionally(err);
+            })
+            .onSuccess(clientRequest -> {
+                System.out.println("[upstream] connected -> streaming request body");
+                forward(clientRequest, request, result);
+            });
 
         return result;
     }
@@ -53,8 +61,12 @@ public final class VertxUpstreamClient implements UpstreamClient {
         copyRequestHeaders(request.headers(), clientRequest);
 
         clientRequest.response()
-            .onFailure(result::completeExceptionally)
+            .onFailure(err -> {
+                System.out.println("[upstream] no response received: " + err);
+                result.completeExceptionally(err);
+            })
             .onSuccess(clientResponse -> {
+                System.out.println("[upstream] response headers received, status=" + clientResponse.statusCode());
                 GatewayHeaders headers = GatewayHeaders.empty();
                 clientResponse.headers().forEach(entry -> {
                     if (!SKIP_RESPONSE_HEADERS.contains(entry.getKey().toLowerCase())) {

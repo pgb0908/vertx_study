@@ -29,14 +29,17 @@ final class VertxResponseWriter {
             }
         });
 
+        System.out.println("[response-writer] streaming body to client, status=" + gatewayResponse.statusCode());
         CompletableFuture<Void> done = new CompletableFuture<>();
         gatewayResponse.body().subscribe(new VertxWriteStreamSubscriber(response, done));
 
         Promise<Void> promise = Promise.promise();
         done.whenComplete((v, err) -> {
             if (err != null) {
+                System.out.println("[response-writer] failed while streaming response body: " + err);
                 promise.tryFail(err);
             } else {
+                System.out.println("[response-writer] response fully written to client");
                 promise.tryComplete();
             }
         });

@@ -29,11 +29,24 @@ public final class GatewayEngine {
     }
 
     public CompletableFuture<GatewayResponse> execute(GatewayExchange exchange) {
+        System.out.println("[engine] execute() start: " + exchange.request().method() + " " + exchange.request().uri()
+            + " route=" + exchange.route().path() + " policies=" + policies.size());
         return runBefore(exchange, 0)
-            .thenCompose(v -> upstreamClient.execute(exchange.route().endpoint(), exchange.request()))
+            .thenCompose(v -> {
+                System.out.println("[engine] before-chain done -> dispatching to upstream " + exchange.route().endpoint());
+                return upstreamClient.execute(exchange.route().endpoint(), exchange.request());
+            })
             .thenCompose(response -> {
+                System.out.println("[engine] upstream responded status=" + response.statusCode() + " -> running after-chain");
                 exchange.response(response);
                 return runAfter(exchange, response, policies.size() - 1);
+            })
+            .whenComplete((response, err) -> {
+                if (err != null) {
+                    System.out.println("[engine] execute() failed: " + err);
+                } else {
+                    System.out.println("[engine] execute() complete -> status=" + response.statusCode());
+                }
             });
     }
 
@@ -42,7 +55,9 @@ public final class GatewayEngine {
         if (index >= policies.size()) {
             return CompletableFuture.completedFuture(null);
         }
-        return policies.get(index).before(exchange)
+        GatewayPolicy policy = policies.get(index);
+        System.out.println("[engine]   before-policy[" + index + "] " + policy.getClass().getSimpleName());
+        return policy.before(exchange)
             .thenCompose(v -> runBefore(exchange, index + 1));
     }
 
@@ -51,7 +66,9 @@ public final class GatewayEngine {
         if (index < 0) {
             return CompletableFuture.completedFuture(response);
         }
-        return policies.get(index).after(exchange, response)
+        GatewayPolicy policy = policies.get(index);
+        System.out.println("[engine]   after-policy[" + index + "] " + policy.getClass().getSimpleName());
+        return policy.after(exchange, response)
             .thenCompose(next -> runAfter(exchange, next, index - 1));
     }
 }
