@@ -11,6 +11,8 @@ import org.example.gateway.day10.domain.model.GatewayRequest;
 import org.example.gateway.day10.domain.model.GatewayResponse;
 import org.example.gateway.day10.domain.upstream.Endpoint;
 import org.example.gateway.day10.domain.upstream.UpstreamClient;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -20,6 +22,8 @@ import java.util.concurrent.CompletableFuture;
  * 모르고 UpstreamClient 인터페이스만 본다 (Arch.md 9절).
  */
 public final class VertxUpstreamClient implements UpstreamClient {
+
+    private static final Logger log = LoggerFactory.getLogger(VertxUpstreamClient.class);
 
     private static final Set<String> SKIP_REQUEST_HEADERS = Set.of("content-length", "transfer-encoding", "host");
     private static final Set<String> SKIP_RESPONSE_HEADERS = Set.of("content-length", "transfer-encoding");
@@ -32,8 +36,9 @@ public final class VertxUpstreamClient implements UpstreamClient {
 
     @Override
     public CompletableFuture<GatewayResponse> execute(Endpoint endpoint, GatewayRequest request) {
-        System.out.println("[upstream] connecting to " + endpoint.host() + ":" + endpoint.port()
-            + " for " + request.method() + " " + request.uri());
+        log.debug("[upstream] connecting {}:{} {} {}", endpoint.host(), endpoint.port(),
+            request.method(), request.uri());
+
         RequestOptions options = new RequestOptions()
             .setHost(endpoint.host())
             .setPort(endpoint.port())
@@ -44,11 +49,11 @@ public final class VertxUpstreamClient implements UpstreamClient {
 
         client.request(options)
             .onFailure(err -> {
-                System.out.println("[upstream] connection failed: " + err);
+                log.error("[upstream] connection failed: {}", err.getMessage(), err);
                 result.completeExceptionally(err);
             })
             .onSuccess(clientRequest -> {
-                System.out.println("[upstream] connected -> streaming request body");
+                log.debug("[upstream] connected -> streaming request body");
                 forward(clientRequest, request, result);
             });
 
@@ -62,11 +67,11 @@ public final class VertxUpstreamClient implements UpstreamClient {
 
         clientRequest.response()
             .onFailure(err -> {
-                System.out.println("[upstream] no response received: " + err);
+                log.error("[upstream] no response received: {}", err.getMessage(), err);
                 result.completeExceptionally(err);
             })
             .onSuccess(clientResponse -> {
-                System.out.println("[upstream] response headers received, status=" + clientResponse.statusCode());
+                log.debug("[upstream] response status={}", clientResponse.statusCode());
                 GatewayHeaders headers = GatewayHeaders.empty();
                 clientResponse.headers().forEach(entry -> {
                     if (!SKIP_RESPONSE_HEADERS.contains(entry.getKey().toLowerCase())) {

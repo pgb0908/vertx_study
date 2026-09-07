@@ -4,6 +4,8 @@ import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.http.HttpServerResponse;
 import org.example.gateway.day10.domain.model.GatewayResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -15,6 +17,7 @@ import java.util.concurrent.CompletableFuture;
  */
 final class VertxResponseWriter {
 
+    private static final Logger log = LoggerFactory.getLogger(VertxResponseWriter.class);
     private static final Set<String> SKIP_HEADERS = Set.of("content-length", "transfer-encoding");
 
     private VertxResponseWriter() {
@@ -29,17 +32,17 @@ final class VertxResponseWriter {
             }
         });
 
-        System.out.println("[response-writer] streaming body to client, status=" + gatewayResponse.statusCode());
+        log.debug("[response-writer] streaming body to client, status={}", gatewayResponse.statusCode());
         CompletableFuture<Void> done = new CompletableFuture<>();
         gatewayResponse.body().subscribe(new VertxWriteStreamSubscriber(response, done));
 
         Promise<Void> promise = Promise.promise();
         done.whenComplete((v, err) -> {
             if (err != null) {
-                System.out.println("[response-writer] failed while streaming response body: " + err);
+                log.error("[response-writer] failed while streaming response body: {}", err.getMessage(), err);
                 promise.tryFail(err);
             } else {
-                System.out.println("[response-writer] response fully written to client");
+                log.debug("[response-writer] response fully written to client");
                 promise.tryComplete();
             }
         });
