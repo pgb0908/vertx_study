@@ -21,8 +21,23 @@ import java.util.concurrent.Flow;
  * chunk만 upstream에 요청하고, 그 chunk의 필터 체인 처리 + sink.onNext() 전달이
  * 끝난 뒤에야 다음 chunk를 요청한다 — backpressure(request/cancel 위임)뿐 아니라
  * 순서 보장(serialization)까지 이 클래스의 책임이다.
+ *
+ * 상태는 세 가지뿐이다:
+ *   IDLE             — 아무 것도 요청하지 않은 상태(downstream demand가 없음)
+ *   AWAITING_UPSTREAM — upstream에 1개를 요청해두고 onNext/onComplete/onError 중
+ *                       무엇이 올지 기다리는 상태 — 아직 "처리 중인 chunk"는 없다
+ *   PROCESSING        — onNext로 chunk를 받아 필터 체인(비동기)을 돌리는 중
+ *
+ * onComplete/onError를 지금 당장 sink로 넘기지 않고 미뤄야 하는 경우는 오직
+ * PROCESSING 상태일 때뿐이다 — 그래야 "아직 필터 처리 중인 chunk"를 추월하지
+ * 않는다. AWAITING_UPSTREAM 상태(예: 빈 바디라 애초에 chunk가 하나도 없는 경우)에서
+ * onComplete가 오면 기다릴 대상 자체가 없으므로 즉시 전달해야 한다 — 이걸
+ * PROCESSING과 구분하지 않으면 빈 바디에서 영원히 onComplete가 전달되지 않는
+ * 행(hang) 버그가 생긴다.
  */
 final class FilterChainBodySubscriber implements Flow.Subscriber<byte[]> {
+
+    private enum State { IDLE, AWAITING_UPSTREAM, PROCESSING }
 
     private final Flow.Subscriber<? super byte[]> sink;
     private final List<Filter> filters;
@@ -31,7 +46,7 @@ final class FilterChainBodySubscriber implements Flow.Subscriber<byte[]> {
     private final Object lock = new Object();
     private Flow.Subscription upstream;
     private long requested = 0;
-    private boolean processing = false;
+    private State state = State.IDLE;
     private boolean upstreamCompleted = false;
     private Throwable upstreamError = null;
 
@@ -54,9 +69,9 @@ final class FilterChainBodySubscriber implements Flow.Subscriber<byte[]> {
                 boolean shouldPull;
                 synchronized (lock) {
                     requested += n;
-                    shouldPull = !processing && requested > 0;
+                    shouldPull = state == State.IDLE && requested > 0;
                     if (shouldPull) {
-                        processing = true;
+                        state = State.AWAITING_UPSTREAM;
                     }
                 }
                 if (shouldPull) {
@@ -73,6 +88,9 @@ final class FilterChainBodySubscriber implements Flow.Subscriber<byte[]> {
 
     @Override
     public void onNext(byte[] chunk) {
+        synchronized (lock) {
+            state = State.PROCESSING;
+        }
         applyChain(chunk).whenComplete((result, err) -> {
             if (err != null) {
                 sink.onError(err);
@@ -83,14 +101,13 @@ final class FilterChainBodySubscriber implements Flow.Subscriber<byte[]> {
             Throwable failure;
             boolean pullMore;
             synchronized (lock) {
-                processing = false;
                 requested = Math.max(0, requested - 1);
                 completed = upstreamCompleted;
                 failure = upstreamError;
                 pullMore = !completed && failure == null && requested > 0;
-                if (pullMore) {
-                    processing = true;
-                }
+                // completed/failure가 이미 true면 스트림은 여기서 끝나고 이후 어떤
+                // 콜백도 state를 다시 보지 않으므로, 이 경우 값은 의미가 없다.
+                state = pullMore ? State.AWAITING_UPSTREAM : State.IDLE;
             }
 
             // 다음 chunk를 요청하기 전에, 이 chunk 하나는 반드시 먼저 sink로 전달한다
@@ -107,36 +124,30 @@ final class FilterChainBodySubscriber implements Flow.Subscriber<byte[]> {
         });
     }
 
-    /**
-     * 마지막 chunk가 아직 처리 중일 때 upstream이 onComplete/onError를 먼저 신호할 수
-     * 있다(예: Vert.x가 마지막 buffer 전달과 endHandler를 같은 호출 스택에서 발생시키는
-     * 경우). 그 경우 여기서 즉시 sink에 전달하지 않고, 마지막 chunk의 처리가 끝난
-     * 뒤(onNext의 whenComplete)에 전달되도록 미룬다.
-     */
     @Override
     public void onError(Throwable t) {
-        boolean inFlight;
+        boolean deferred;
         synchronized (lock) {
-            inFlight = processing;
-            if (inFlight) {
+            deferred = state == State.PROCESSING;
+            if (deferred) {
                 upstreamError = t;
             }
         }
-        if (!inFlight) {
+        if (!deferred) {
             sink.onError(t);
         }
     }
 
     @Override
     public void onComplete() {
-        boolean inFlight;
+        boolean deferred;
         synchronized (lock) {
-            inFlight = processing;
-            if (inFlight) {
+            deferred = state == State.PROCESSING;
+            if (deferred) {
                 upstreamCompleted = true;
             }
         }
-        if (!inFlight) {
+        if (!deferred) {
             sink.onComplete();
         }
     }

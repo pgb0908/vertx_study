@@ -111,6 +111,18 @@ PoC를 넘어 실무에서 쓸 수 있는 구조로 한 단계 더 진행했다.
   (`day10/TESTING.md`), `[server]`→`[engine]`→`[filter-chain]`→`[upstream]`
   순서의 rid 기반 추적 로그 갱신.
 
+**리뷰로 잡은 버그**: `FilterChainBodySubscriber`가 upstream `Subscription`을
+sink에 그대로 넘기고(`sink.onSubscribe(s)`) `onNext()`에서 `applyChain(chunk)`를
+기다리지 않고 반환하고 있었다 — chunk별 필터 처리 시간이 다르면(A=30ms,
+B=5ms, C=10ms) 처리 순서가 완료 순서로 뒤바뀌어 HTTP body 청크가 재정렬될 수
+있는 구조였다. `FilterChainBodySubscriber`가 upstream 요청을 직접 소유해서
+한 번에 최대 1개 chunk만 요청·처리·전달하도록 고쳤다. 고치는 과정에서 두
+번째 버그(빈 바디 요청에서 `onComplete`가 영원히 전달되지 않는 hang)를
+만들었다가 실제 curl로 재현·수정했다 — "처리 중인 chunk가 있을 때만
+onComplete를 미룬다"는 상태 구분(`AWAITING_UPSTREAM` vs `PROCESSING`)이
+빠져 있었던 것. `FilterChainBodySubscriberTest`에 순서 보장 + 빈 바디 회귀
+테스트를 추가했다.
+
 ### 다음 할 일 (2차)
 
 1. **CircuitBreaker 실제 구현** — `domain.upstream.CircuitBreaker` 인터페이스는
