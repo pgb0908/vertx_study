@@ -14,20 +14,10 @@ import java.util.concurrent.CompletableFuture;
  * onRequestBody  ↔ Proxygen onBody(요청 방향) — 요청 바디 청크 변환
  * onResponseBody ↔ Proxygen sendBody(응답 방향) — 응답 바디 청크 변환
  *
- * upstream/downstream 포인터는 GatewayEngine이 체인 구성 시 주입한다.
- * 현재 실행 흐름은 Engine이 인덱스로 오케스트레이션하고, 포인터는 향후
- * 동적 삽입/제거 시 활용한다.
+ * Filter는 자신의 동작만 알 뿐, 다른 Filter를 가리키는 포인터를 갖지 않는다 —
+ * 실행 순서(0→N / N→0)는 FilterChain이 전담 소유한다 (day10 feedback 3절).
  */
 public abstract class Filter {
-
-    /** 요청 방향 다음 필터 — GatewayEngine이 설정 */
-    private Filter upstream;
-
-    /** 응답 방향 이전 필터 — GatewayEngine이 설정 */
-    private Filter downstream;
-
-    public final void linkUpstream(Filter upstream) { this.upstream = upstream; }
-    public final void linkDownstream(Filter downstream) { this.downstream = downstream; }
 
     /**
      * 요청 헤더 처리.
@@ -38,7 +28,7 @@ public abstract class Filter {
 
     /**
      * 요청 바디 청크 변환. 기본값: 청크 그대로 통과.
-     * GatewayEngine이 요청 바디의 각 청크를 필터 순서(0→N)로 통과시킨다.
+     * FilterChain이 요청 바디의 각 청크를 필터 순서(0→N)로 통과시킨다.
      */
     public CompletableFuture<byte[]> onRequestBody(byte[] chunk) {
         return CompletableFuture.completedFuture(chunk);
@@ -51,7 +41,7 @@ public abstract class Filter {
 
     /**
      * 응답 바디 청크 변환. 기본값: 청크 그대로 통과.
-     * GatewayEngine이 응답 바디의 각 청크를 역순(N→0)으로 통과시킨다.
+     * FilterChain이 응답 바디의 각 청크를 역순(N→0)으로 통과시킨다.
      */
     public CompletableFuture<byte[]> onResponseBody(byte[] chunk) {
         return CompletableFuture.completedFuture(chunk);

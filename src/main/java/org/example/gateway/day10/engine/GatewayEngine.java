@@ -1,70 +1,79 @@
 package org.example.gateway.day10.engine;
 
-import org.example.gateway.day10.domain.filter.Filter;
 import org.example.gateway.day10.domain.filter.FilterResult;
 import org.example.gateway.day10.domain.model.GatewayBody;
 import org.example.gateway.day10.domain.model.GatewayExchange;
+import org.example.gateway.day10.domain.model.GatewayHeaders;
 import org.example.gateway.day10.domain.model.GatewayRequest;
 import org.example.gateway.day10.domain.model.GatewayResponse;
-import org.example.gateway.day10.domain.upstream.UpstreamClient;
+import org.example.gateway.day10.domain.upstream.Endpoint;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.List;
+import java.nio.charset.StandardCharsets;
+import java.util.Optional;
+import java.util.function.Supplier;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Filter 체인 오케스트레이터.
+ * Gateway 요청 한 건의 전체 실행 흐름을 소유하는 오케스트레이터 (Arch.md 4절
+ * 실행 흐름 다이어그램 그대로):
  *
- * 실행 순서:
- *   onRequest  [0→N] → upstream → onResponse [N→0]
+ *   Route Match → Downstream FilterChain [0→N] → Endpoint Selection
+ *     → Upstream(Retry/CircuitBreaker/Timeout 포함) → Upstream FilterChain [N→0]
  *
- * 각 바디 청크는 FilterChainBodySubscriber를 통해 필터 체인을 통과한다:
- *   요청 바디: onRequestBody  [0→N]
- *   응답 바디: onResponseBody [N→0]
- *
- * FilterResult.Abort를 받으면 upstream 호출 없이 즉시 응답을 반환한다.
+ * GatewayEngine 자신은 상태를 갖지 않는다(feedback 6절) — snapshot/upstreamExecutor는
+ * 요청마다 바뀌지 않는 설정이고, 거래별 상태는 전부 GatewayExchange가 가진다.
+ * 라우트마다 다른 FilterChain/EndpointSelector를 쓸 수 있도록, 이 두 가지는
+ * RuntimeRoute(라우트 매칭 결과)에서 꺼내 쓴다 — Engine 생성자에 고정하지 않는다.
  */
 public final class GatewayEngine {
 
     private static final Logger log = LoggerFactory.getLogger(GatewayEngine.class);
 
-    private final List<Filter> filters;
-    private final UpstreamClient upstreamClient;
+    private final Supplier<RuntimeSnapshot> snapshot;
+    private final UpstreamExecutor upstreamExecutor;
 
-    public GatewayEngine(List<Filter> filters, UpstreamClient upstreamClient) {
-        this.filters = filters;
-        this.upstreamClient = upstreamClient;
-        linkChain();
+    public GatewayEngine(Supplier<RuntimeSnapshot> snapshot, UpstreamExecutor upstreamExecutor) {
+        this.snapshot = snapshot;
+        this.upstreamExecutor = upstreamExecutor;
     }
 
-    /** upstream/downstream 포인터 연결 — 향후 동적 삽입/제거 시 활용 */
-    private void linkChain() {
-        for (int i = 0; i < filters.size() - 1; i++) {
-            filters.get(i).linkUpstream(filters.get(i + 1));
-            filters.get(i + 1).linkDownstream(filters.get(i));
+    public CompletableFuture<GatewayResponse> execute(GatewayRequest request) {
+        Optional<RuntimeRoute> matched = snapshot.get().routeTable().match(request.uri());
+        if (matched.isEmpty()) {
+            log.debug("[engine] no route matches {} {}", request.method(), request.uri());
+            return CompletableFuture.completedFuture(notFound());
         }
-    }
 
-    public CompletableFuture<GatewayResponse> execute(GatewayExchange exchange) {
-        log.debug("[engine] rid={} start {} {} filters={}", exchange.requestId(),
-            exchange.request().method(), exchange.request().uri(), filters.size());
+        RuntimeRoute runtimeRoute = matched.get();
+        GatewayExchange exchange = new GatewayExchange(request, runtimeRoute.route());
+        FilterChain filterChain = runtimeRoute.filterChain();
 
-        return runRequest(exchange, exchange.request(), 0)
+        log.debug("[engine] rid={} start {} {}", exchange.requestId(), request.method(), request.uri());
+
+        return filterChain.executeDownstream(exchange, exchange.request())
             .thenCompose(result -> {
                 if (result instanceof FilterResult.Abort abort) {
                     log.debug("[engine] rid={} aborted -> status={}", exchange.requestId(), abort.response().statusCode());
+                    exchange.response(abort.response());
                     return CompletableFuture.completedFuture(abort.response());
                 }
-                GatewayRequest req = ((FilterResult.Next) result).request();
-                GatewayRequest withTransformedBody = withWrappedBody(req, true);
-                log.debug("[engine] rid={} onRequest-chain done -> upstream {}", exchange.requestId(), exchange.route().endpoint());
-                return upstreamClient.execute(exchange.route().endpoint(), withTransformedBody)
-                    .thenCompose(response -> {
-                        log.debug("[engine] rid={} upstream status={} -> onResponse-chain", exchange.requestId(), response.statusCode());
-                        exchange.response(response);
-                        GatewayResponse withTransformedResponseBody = withWrappedBody(response, false);
-                        return runResponse(exchange, withTransformedResponseBody, filters.size() - 1);
+                GatewayRequest current = ((FilterResult.Next) result).request();
+                exchange.request(current);
+                Endpoint endpoint = runtimeRoute.endpointSelector().select(exchange);
+                log.debug("[engine] rid={} downstream-chain done -> upstream {}", exchange.requestId(), endpoint);
+                GatewayRequest withBody = withWrappedRequestBody(current, filterChain);
+                return upstreamExecutor.execute(endpoint, withBody)
+                    .thenCompose(rawResponse -> {
+                        log.debug("[engine] rid={} upstream status={} -> upstream-chain", exchange.requestId(), rawResponse.statusCode());
+                        exchange.upstreamResponse(rawResponse);
+                        GatewayResponse withRespBody = withWrappedResponseBody(rawResponse, filterChain);
+                        return filterChain.executeUpstream(exchange, withRespBody)
+                            .thenApply(finalResponse -> {
+                                exchange.response(finalResponse);
+                                return finalResponse;
+                            });
                     });
             })
             .whenComplete((response, err) -> {
@@ -73,39 +82,18 @@ public final class GatewayEngine {
             });
     }
 
-    /** onRequest 체인: 필터 순서대로 (0→N) */
-    private CompletableFuture<FilterResult> runRequest(GatewayExchange exchange, GatewayRequest request, int index) {
-        if (index >= filters.size()) {
-            return CompletableFuture.completedFuture(new FilterResult.Next(request));
-        }
-        Filter filter = filters.get(index);
-        log.debug("[engine] rid={} onRequest[{}] {}", exchange.requestId(), index, filter.getClass().getSimpleName());
-        return filter.onRequest(exchange, request).thenCompose(result -> {
-            if (result instanceof FilterResult.Abort) return CompletableFuture.completedFuture(result);
-            return runRequest(exchange, ((FilterResult.Next) result).request(), index + 1);
-        });
+    private static GatewayResponse notFound() {
+        byte[] body = "no route matched".getBytes(StandardCharsets.UTF_8);
+        return new GatewayResponse(404, GatewayHeaders.empty(), GatewayBody.of(body));
     }
 
-    /** onResponse 체인: 필터 역순으로 (N→0) */
-    private CompletableFuture<GatewayResponse> runResponse(GatewayExchange exchange, GatewayResponse response, int index) {
-        if (index < 0) return CompletableFuture.completedFuture(response);
-        Filter filter = filters.get(index);
-        log.debug("[engine] rid={} onResponse[{}] {}", exchange.requestId(), index, filter.getClass().getSimpleName());
-        return filter.onResponse(exchange, response)
-            .thenCompose(next -> runResponse(exchange, next, index - 1));
-    }
-
-    private GatewayRequest withWrappedBody(GatewayRequest req, boolean requestDir) {
-        GatewayBody wrapped = wrapBody(req.body(), requestDir);
+    private static GatewayRequest withWrappedRequestBody(GatewayRequest req, FilterChain filterChain) {
+        GatewayBody wrapped = filterChain.wrapRequestBody(req.body());
         return new GatewayRequest(req.method(), req.uri(), req.headers(), wrapped);
     }
 
-    private GatewayResponse withWrappedBody(GatewayResponse res, boolean requestDir) {
-        GatewayBody wrapped = wrapBody(res.body(), requestDir);
+    private static GatewayResponse withWrappedResponseBody(GatewayResponse res, FilterChain filterChain) {
+        GatewayBody wrapped = filterChain.wrapResponseBody(res.body());
         return new GatewayResponse(res.statusCode(), res.headers(), wrapped);
-    }
-
-    private GatewayBody wrapBody(GatewayBody body, boolean requestDir) {
-        return subscriber -> body.subscribe(new FilterChainBodySubscriber(subscriber, filters, requestDir));
     }
 }

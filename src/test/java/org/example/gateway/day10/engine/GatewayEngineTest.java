@@ -8,7 +8,12 @@ import org.example.gateway.day10.domain.model.GatewayHeaders;
 import org.example.gateway.day10.domain.model.GatewayRequest;
 import org.example.gateway.day10.domain.model.GatewayResponse;
 import org.example.gateway.day10.domain.route.GatewayRoute;
+import org.example.gateway.day10.domain.upstream.CircuitBreaker;
+import org.example.gateway.day10.domain.upstream.EgressGroup;
 import org.example.gateway.day10.domain.upstream.Endpoint;
+import org.example.gateway.day10.domain.upstream.RetryPolicy;
+import org.example.gateway.day10.domain.upstream.RoundRobinLoadBalancer;
+import org.example.gateway.day10.domain.upstream.TimeoutPolicy;
 import org.example.gateway.day10.domain.upstream.UpstreamClient;
 import org.junit.jupiter.api.Test;
 
@@ -19,27 +24,37 @@ import java.util.concurrent.CompletableFuture;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * GatewayEngine이 Vert.x 없이(순수 JUnit5) Filter 체인 순서를 지키는지 검증.
+ * GatewayEngine이 Vert.x 없이(순수 JUnit5) route match -> Filter 체인 ->
+ * upstream 순서를 지키는지 검증.
  */
 class GatewayEngineTest {
 
-    private static final GatewayRoute ROUTE = new GatewayRoute("/echo", new Endpoint("localhost", 9999));
+    private static final Endpoint ENDPOINT = new Endpoint("localhost", 9999);
 
     @Test
     void runsOnRequestInOrderThenUpstreamThenOnResponseInReverse() {
         List<String> calls = new ArrayList<>();
         Filter first = recordingFilter(calls, "1");
         Filter second = recordingFilter(calls, "2");
-        UpstreamClient upstream = (endpoint, request) -> {
-            calls.add("upstream");
-            return CompletableFuture.completedFuture(response(200));
-        };
+        UpstreamClient upstream = recordingUpstream(calls);
 
-        GatewayEngine engine = new GatewayEngine(List.of(first, second), upstream);
-        GatewayResponse result = engine.execute(exchange()).join();
+        GatewayEngine engine = engine("/echo", List.of(first, second), upstream);
+        GatewayResponse result = engine.execute(request("/echo")).join();
 
         assertEquals(200, result.statusCode());
         assertEquals(List.of("onRequest-1", "onRequest-2", "upstream", "onResponse-2", "onResponse-1"), calls);
+    }
+
+    @Test
+    void noRouteMatchReturns404WithoutCallingUpstream() {
+        List<String> calls = new ArrayList<>();
+        UpstreamClient upstream = recordingUpstream(calls);
+
+        GatewayEngine engine = engine("/echo", List.of(), upstream);
+        GatewayResponse result = engine.execute(request("/nope")).join();
+
+        assertEquals(404, result.statusCode());
+        assertEquals(List.of(), calls);
     }
 
     @Test
@@ -58,20 +73,17 @@ class GatewayEngineTest {
             }
         };
         Filter neverCalled = recordingFilter(calls, "never");
-        UpstreamClient upstream = (endpoint, request) -> {
-            calls.add("upstream");
-            return CompletableFuture.completedFuture(response(200));
-        };
+        UpstreamClient upstream = recordingUpstream(calls);
 
-        GatewayEngine engine = new GatewayEngine(List.of(abortingFilter, neverCalled), upstream);
-        GatewayResponse result = engine.execute(exchange()).join();
+        GatewayEngine engine = engine("/echo", List.of(abortingFilter, neverCalled), upstream);
+        GatewayResponse result = engine.execute(request("/echo")).join();
 
         assertEquals(401, result.statusCode());
         assertEquals(List.of("onRequest-abort"), calls);
     }
 
     @Test
-    void onRequestCanModifyRequest() {
+    void onRequestCanModifyRequestSeenByUpstream() {
         List<String> seenUris = new ArrayList<>();
         Filter rewritingFilter = new Filter() {
             @Override
@@ -85,13 +97,13 @@ class GatewayEngineTest {
                 return CompletableFuture.completedFuture(response);
             }
         };
-        UpstreamClient upstream = (endpoint, request) -> {
-            seenUris.add(request.uri());
+        UpstreamClient upstream = (endpoint, req) -> {
+            seenUris.add(req.uri());
             return CompletableFuture.completedFuture(response(200));
         };
 
-        GatewayEngine engine = new GatewayEngine(List.of(rewritingFilter), upstream);
-        engine.execute(exchange()).join();
+        GatewayEngine engine = engine("/echo", List.of(rewritingFilter), upstream);
+        engine.execute(request("/echo")).join();
 
         assertEquals(List.of("/rewritten"), seenUris);
     }
@@ -109,15 +121,29 @@ class GatewayEngineTest {
             }
         };
         List<String> calls = new ArrayList<>();
-        UpstreamClient upstream = (endpoint, request) -> {
+        UpstreamClient upstream = recordingUpstream(calls);
+
+        GatewayEngine engine = engine("/echo", List.of(failing), upstream);
+
+        assertThrows(Exception.class, () -> engine.execute(request("/echo")).join());
+        assertEquals(List.of(), calls);
+    }
+
+    private static GatewayEngine engine(String path, List<Filter> filters, UpstreamClient upstream) {
+        EgressGroup group = new EgressGroup("test-upstream", List.of(ENDPOINT));
+        GatewayRoute route = new GatewayRoute(path, group, filters);
+        RuntimeRoute runtimeRoute = new RuntimeRoute(route, new RoundRobinLoadBalancer());
+        RuntimeSnapshot snapshot = new RuntimeSnapshot(new RouteTable(List.of(runtimeRoute)));
+        UpstreamExecutor executor = new UpstreamExecutor(
+            upstream, RetryPolicy.none(), CircuitBreaker.disabled(), TimeoutPolicy.none());
+        return new GatewayEngine(() -> snapshot, executor);
+    }
+
+    private static UpstreamClient recordingUpstream(List<String> calls) {
+        return (endpoint, req) -> {
             calls.add("upstream");
             return CompletableFuture.completedFuture(response(200));
         };
-
-        GatewayEngine engine = new GatewayEngine(List.of(failing), upstream);
-
-        assertThrows(Exception.class, () -> engine.execute(exchange()).join());
-        assertEquals(List.of(), calls);
     }
 
     private static Filter recordingFilter(List<String> calls, String name) {
@@ -135,9 +161,8 @@ class GatewayEngineTest {
         };
     }
 
-    private static GatewayExchange exchange() {
-        GatewayRequest request = new GatewayRequest("GET", "/echo", GatewayHeaders.empty(), GatewayBody.EMPTY);
-        return new GatewayExchange(request, ROUTE);
+    private static GatewayRequest request(String uri) {
+        return new GatewayRequest("GET", uri, GatewayHeaders.empty(), GatewayBody.EMPTY);
     }
 
     private static GatewayResponse response(int statusCode) {
