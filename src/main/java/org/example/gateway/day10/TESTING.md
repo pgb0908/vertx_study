@@ -60,11 +60,11 @@ exchange가 없어서 `[server]`/최초 `[engine]` 로그에는 rid가 없다).
 [engine] rid=xxxxxxxx start GET /echo
 [filter-chain] rid=xxxxxxxx onRequest[0] LoggingFilter
 [request]  rid=xxxxxxxx GET /echo
-[engine] rid=xxxxxxxx downstream-chain done -> upstream Endpoint[host=localhost, port=9001]
+[engine] rid=xxxxxxxx request filters done -> calling backend Endpoint[host=localhost, port=9001]
 [upstream] connecting localhost:9001 GET /echo
 [upstream] connected -> streaming request body
 [upstream] response status=200
-[engine] rid=xxxxxxxx upstream status=200 -> upstream-chain
+[engine] rid=xxxxxxxx backend responded status=200 -> response filters
 [filter-chain] rid=xxxxxxxx onResponse[0] LoggingFilter
 [response] rid=xxxxxxxx GET /echo -> 200
 [engine] rid=xxxxxxxx complete status=200

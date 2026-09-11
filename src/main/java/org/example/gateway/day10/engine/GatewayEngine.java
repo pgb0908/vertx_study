@@ -22,6 +22,10 @@ import java.util.concurrent.CompletableFuture;
  *   Route Match → Downstream FilterChain [0→N] → Endpoint Selection
  *     → Upstream(Retry/CircuitBreaker/Timeout 포함) → Upstream FilterChain [N→0]
  *
+ * execute()는 이 5단계를 그대로 나열하고, 각 단계는 private 메서드로 분리했다 —
+ * 다이어그램의 박스 하나가 메서드 하나에 대응하도록 해서, 중첩된 람다 안에
+ * 흐름이 숨지 않게 하기 위해서다.
+ *
  * GatewayEngine 자신은 상태를 갖지 않는다(feedback 6절) — snapshot/upstreamExecutor는
  * 요청마다 바뀌지 않는 설정이고, 거래별 상태는 전부 GatewayExchange가 가진다.
  * 라우트마다 다른 FilterChain/EndpointSelector를 쓸 수 있도록, 이 두 가지는
@@ -48,38 +52,66 @@ public final class GatewayEngine {
 
         RuntimeRoute runtimeRoute = matched.get();
         GatewayExchange exchange = new GatewayExchange(request, runtimeRoute.route());
-        FilterChain filterChain = runtimeRoute.filterChain();
-
         log.debug("[engine] rid={} start {} {}", exchange.requestId(), request.method(), request.uri());
 
+        return runRequestFilters(exchange, runtimeRoute)
+            .whenComplete((response, err) -> logCompletion(exchange, response, err));
+    }
+
+    /**
+     * 1단계: Filter.onRequest()를 0→N 순서로 실행(feedback 3절의 downstream 방향).
+     * "upstream/downstream"이라는 이름은 UpstreamClient/UpstreamExecutor(백엔드 서버
+     * 자체를 가리킴)와 헷갈리기 쉬워서, 여기서는 Filter의 실제 메서드명(onRequest/
+     * onResponse)을 따라 request/response로 부른다 — FilterChain.executeDownstream()
+     * 은 feedback 문서 용어를 그대로 유지한다(그쪽엔 이 혼동이 없음).
+     * Abort면 백엔드 호출 없이 즉시 끝내고, 아니면 2단계로.
+     */
+    private CompletableFuture<GatewayResponse> runRequestFilters(GatewayExchange exchange, RuntimeRoute runtimeRoute) {
+        FilterChain filterChain = runtimeRoute.filterChain();
         return filterChain.executeDownstream(exchange, exchange.request())
-            .thenCompose(result -> {
-                if (result instanceof FilterResult.Abort abort) {
-                    log.debug("[engine] rid={} aborted -> status={}", exchange.requestId(), abort.response().statusCode());
-                    exchange.response(abort.response());
-                    return CompletableFuture.completedFuture(abort.response());
-                }
-                GatewayRequest current = ((FilterResult.Next) result).request();
-                exchange.request(current);
-                Endpoint endpoint = runtimeRoute.endpointSelector().select(exchange);
-                log.debug("[engine] rid={} downstream-chain done -> upstream {}", exchange.requestId(), endpoint);
-                GatewayRequest withBody = withWrappedRequestBody(current, filterChain);
-                return upstreamExecutor.execute(endpoint, withBody)
-                    .thenCompose(rawResponse -> {
-                        log.debug("[engine] rid={} upstream status={} -> upstream-chain", exchange.requestId(), rawResponse.statusCode());
-                        exchange.upstreamResponse(rawResponse);
-                        GatewayResponse withRespBody = withWrappedResponseBody(rawResponse, filterChain);
-                        return filterChain.executeUpstream(exchange, withRespBody)
-                            .thenApply(finalResponse -> {
-                                exchange.response(finalResponse);
-                                return finalResponse;
-                            });
-                    });
-            })
-            .whenComplete((response, err) -> {
-                if (err != null) log.error("[engine] rid={} failed: {}", exchange.requestId(), err.getMessage(), err);
-                else log.debug("[engine] rid={} complete status={}", exchange.requestId(), response.statusCode());
+            .thenCompose(result -> result instanceof FilterResult.Abort abort
+                ? abort(exchange, abort)
+                : callUpstream(exchange, runtimeRoute, filterChain, ((FilterResult.Next) result).request()));
+    }
+
+    private CompletableFuture<GatewayResponse> abort(GatewayExchange exchange, FilterResult.Abort abort) {
+        log.debug("[engine] rid={} aborted -> status={}", exchange.requestId(), abort.response().statusCode());
+        exchange.response(abort.response());
+        return CompletableFuture.completedFuture(abort.response());
+    }
+
+    /** 2단계: Endpoint Selection → 3단계: Upstream 호출(Retry/CircuitBreaker/Timeout 포함). */
+    private CompletableFuture<GatewayResponse> callUpstream(GatewayExchange exchange, RuntimeRoute runtimeRoute,
+                                                              FilterChain filterChain, GatewayRequest downstreamResult) {
+        exchange.request(downstreamResult);
+        Endpoint endpoint = runtimeRoute.endpointSelector().select(exchange);
+        log.debug("[engine] rid={} request filters done -> calling backend {}", exchange.requestId(), endpoint);
+
+        GatewayRequest withBody = withWrappedRequestBody(downstreamResult, filterChain);
+        return upstreamExecutor.execute(endpoint, withBody)
+            .thenCompose(rawResponse -> runResponseFilters(exchange, filterChain, rawResponse));
+    }
+
+    /** 4단계: Filter.onResponse()를 N→0 역순으로 실행(feedback 3절의 upstream 방향). */
+    private CompletableFuture<GatewayResponse> runResponseFilters(GatewayExchange exchange, FilterChain filterChain,
+                                                                    GatewayResponse rawResponse) {
+        log.debug("[engine] rid={} backend responded status={} -> response filters", exchange.requestId(), rawResponse.statusCode());
+        exchange.upstreamResponse(rawResponse);
+
+        GatewayResponse withBody = withWrappedResponseBody(rawResponse, filterChain);
+        return filterChain.executeUpstream(exchange, withBody)
+            .thenApply(finalResponse -> {
+                exchange.response(finalResponse);
+                return finalResponse;
             });
+    }
+
+    private void logCompletion(GatewayExchange exchange, GatewayResponse response, Throwable err) {
+        if (err != null) {
+            log.error("[engine] rid={} failed: {}", exchange.requestId(), err.getMessage(), err);
+        } else {
+            log.debug("[engine] rid={} complete status={}", exchange.requestId(), response.statusCode());
+        }
     }
 
     private static GatewayResponse notFound() {

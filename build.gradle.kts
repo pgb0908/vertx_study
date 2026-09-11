@@ -65,6 +65,7 @@ registerDayRunTask(7)
 registerDayRunTask(8)
 registerDayRunTask(9)
 registerDayRunTask(10)
+registerDayRunTask(11)
 
 tasks.register<JavaExec>("genDay5Token") {
     group = "application"
