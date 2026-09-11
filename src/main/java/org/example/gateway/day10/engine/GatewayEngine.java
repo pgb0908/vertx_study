@@ -6,7 +6,9 @@ import org.example.gateway.day10.domain.model.GatewayExchange;
 import org.example.gateway.day10.domain.model.GatewayHeaders;
 import org.example.gateway.day10.domain.model.GatewayRequest;
 import org.example.gateway.day10.domain.model.GatewayResponse;
-import org.example.gateway.day10.domain.upstream.Endpoint;
+import org.example.gateway.day10.engine.connector.RuntimeConnector;
+import org.example.gateway.day10.engine.route.RuntimeRoute;
+import org.example.gateway.day10.engine.route.RuntimeSnapshot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -26,25 +28,25 @@ import java.util.concurrent.CompletableFuture;
  * 다이어그램의 박스 하나가 메서드 하나에 대응하도록 해서, 중첩된 람다 안에
  * 흐름이 숨지 않게 하기 위해서다.
  *
- * GatewayEngine 자신은 상태를 갖지 않는다(feedback 6절) — snapshot/upstreamExecutor는
- * 요청마다 바뀌지 않는 설정이고, 거래별 상태는 전부 GatewayExchange가 가진다.
- * 라우트마다 다른 FilterChain/EndpointSelector를 쓸 수 있도록, 이 두 가지는
+ * GatewayEngine 자신은 상태를 갖지 않는다(feedback 6절) — snapshot은 요청마다
+ * 바뀌지 않는 설정이고, 거래별 상태는 전부 GatewayExchange가 가진다. 라우트마다
+ * 다른 FilterChain/목적지(Connector, 가중치 분산 포함)를 쓸 수 있도록, 이 둘은
  * RuntimeRoute(라우트 매칭 결과)에서 꺼내 쓴다 — Engine 생성자에 고정하지 않는다.
+ * Retry/CircuitBreaker/Timeout도 이제 Engine이 아니라 Connector마다 따로 갖는다
+ * (Connector.md의 resilience 설정이 Connector 단위이므로) — RuntimeConnector 참고.
  */
 public final class GatewayEngine {
 
     private static final Logger log = LoggerFactory.getLogger(GatewayEngine.class);
 
     private final Supplier<RuntimeSnapshot> snapshot;
-    private final UpstreamExecutor upstreamExecutor;
 
-    public GatewayEngine(Supplier<RuntimeSnapshot> snapshot, UpstreamExecutor upstreamExecutor) {
+    public GatewayEngine(Supplier<RuntimeSnapshot> snapshot) {
         this.snapshot = snapshot;
-        this.upstreamExecutor = upstreamExecutor;
     }
 
     public CompletableFuture<GatewayResponse> execute(GatewayRequest request) {
-        Optional<RuntimeRoute> matched = snapshot.get().routeTable().match(request.uri());
+        Optional<RuntimeRoute> matched = snapshot.get().routeTable().match(request.method(), request.uri());
         if (matched.isEmpty()) {
             log.debug("[engine] no route matches {} {}", request.method(), request.uri());
             return CompletableFuture.completedFuture(notFound());
@@ -80,15 +82,16 @@ public final class GatewayEngine {
         return CompletableFuture.completedFuture(abort.response());
     }
 
-    /** 2단계: Endpoint Selection → 3단계: Upstream 호출(Retry/CircuitBreaker/Timeout 포함). */
+    /** 2단계: Connector 선택(가중치 분산 포함) → 3단계: Upstream 호출(그 Connector 전용
+     *  Retry/CircuitBreaker/Timeout 포함, RuntimeConnector가 담당). */
     private CompletableFuture<GatewayResponse> callUpstream(GatewayExchange exchange, RuntimeRoute runtimeRoute,
                                                               FilterChain filterChain, GatewayRequest downstreamResult) {
         exchange.request(downstreamResult);
-        Endpoint endpoint = runtimeRoute.endpointSelector().select(exchange);
-        log.debug("[engine] rid={} request filters done -> calling backend {}", exchange.requestId(), endpoint);
+        log.debug("[engine] rid={} request filters done -> selecting destination", exchange.requestId());
 
         GatewayRequest withBody = withWrappedRequestBody(downstreamResult, filterChain);
-        return upstreamExecutor.execute(endpoint, withBody)
+        RuntimeConnector connector = runtimeRoute.connectorSelector().select();
+        return connector.execute(exchange, withBody)
             .thenCompose(rawResponse -> runResponseFilters(exchange, filterChain, rawResponse));
     }
 

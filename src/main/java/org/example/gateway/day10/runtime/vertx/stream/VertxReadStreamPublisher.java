@@ -1,4 +1,4 @@
-package org.example.gateway.day10.runtime.vertx;
+package org.example.gateway.day10.runtime.vertx.stream;
 
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.streams.ReadStream;
@@ -15,12 +15,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Reactive Streams의 request(n)와 자연스럽게 대응된다 — subscribe() 직후 소스를
  * pause()해두고, request(n)이 올 때마다 fetch(n)으로 위임한다.
  */
-final class VertxReadStreamPublisher implements Flow.Publisher<byte[]> {
+public final class VertxReadStreamPublisher implements Flow.Publisher<byte[]> {
 
     private final ReadStream<Buffer> source;
     private final AtomicBoolean subscribed = new AtomicBoolean(false);
 
-    VertxReadStreamPublisher(ReadStream<Buffer> source) {
+    public VertxReadStreamPublisher(ReadStream<Buffer> source) {
         this.source = source;
         source.pause();
     }

@@ -1,0 +1,32 @@
+{
+  "apiVersion": "iip.gateway/v1alpha1",
+  "kind": "Router",
+  "uid": "echo-get-router-uid",
+  "workspaceId": "dev",
+  "id": "echo-get-router",
+  "name": "echo-get-router",
+  "version": "v1",
+  "description": "GET /echo -> echo-connector",
+  "metadata": {
+    "name": "echo-get-router"
+  },
+  "spec": {
+    "rule": {
+      "protocol": "HTTP",
+      "match": {
+        "path": "/echo",
+        "methods": "GET"
+      }
+    },
+    "destinations": [
+      {
+        "destinationRef": {
+          "kind": "Connector",
+          "uid": "echo-connector-uid",
+          "id": "echo-connector",
+          "name": "echo-connector"
+        }
+      }
+    ]
+  }
+}

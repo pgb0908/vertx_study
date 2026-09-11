@@ -9,8 +9,11 @@ import org.example.gateway.day10.domain.model.GatewayBody;
 import org.example.gateway.day10.domain.model.GatewayHeaders;
 import org.example.gateway.day10.domain.model.GatewayRequest;
 import org.example.gateway.day10.domain.model.GatewayResponse;
+import org.example.gateway.day10.domain.model.HopByHopHeaders;
 import org.example.gateway.day10.domain.upstream.Endpoint;
 import org.example.gateway.day10.domain.upstream.UpstreamClient;
+import org.example.gateway.day10.runtime.vertx.stream.VertxReadStreamPublisher;
+import org.example.gateway.day10.runtime.vertx.stream.VertxWriteStreamSubscriber;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -24,9 +27,6 @@ import java.util.concurrent.CompletableFuture;
 public final class VertxUpstreamClient implements UpstreamClient {
 
     private static final Logger log = LoggerFactory.getLogger(VertxUpstreamClient.class);
-
-    private static final Set<String> SKIP_REQUEST_HEADERS = Set.of("content-length", "transfer-encoding", "host");
-    private static final Set<String> SKIP_RESPONSE_HEADERS = Set.of("content-length", "transfer-encoding");
 
     private final HttpClient client;
 
@@ -63,7 +63,8 @@ public final class VertxUpstreamClient implements UpstreamClient {
     private void forward(HttpClientRequest clientRequest, GatewayRequest request,
                           CompletableFuture<GatewayResponse> result) {
         clientRequest.setChunked(true);
-        copyRequestHeaders(request.headers(), clientRequest);
+        GatewayHeaders outgoingHeaders = request.headers().withAdded("via", "1.1 day10-gateway");
+        copyRequestHeaders(outgoingHeaders, clientRequest);
 
         clientRequest.response()
             .onFailure(err -> {
@@ -72,14 +73,20 @@ public final class VertxUpstreamClient implements UpstreamClient {
             })
             .onSuccess(clientResponse -> {
                 log.debug("[upstream] response status={}", clientResponse.statusCode());
-                GatewayHeaders headers = GatewayHeaders.empty();
-                clientResponse.headers().forEach(entry -> {
-                    if (!SKIP_RESPONSE_HEADERS.contains(entry.getKey().toLowerCase())) {
-                        headers.add(entry.getKey(), entry.getValue());
+                GatewayHeaders.Builder headersBuilder = GatewayHeaders.builder();
+                clientResponse.headers().forEach(entry -> headersBuilder.add(entry.getKey(), entry.getValue()));
+                GatewayHeaders responseHeaders = headersBuilder.build();
+                Set<String> skip = HopByHopHeaders.namesFor(responseHeaders);
+
+                GatewayHeaders.Builder filtered = GatewayHeaders.builder();
+                responseHeaders.asMap().forEach((name, values) -> {
+                    if (!skip.contains(name.toLowerCase())) {
+                        values.forEach(v -> filtered.add(name, v));
                     }
                 });
+
                 GatewayBody body = new VertxReadStreamPublisher(clientResponse)::subscribe;
-                result.complete(new GatewayResponse(clientResponse.statusCode(), headers, body));
+                result.complete(new GatewayResponse(clientResponse.statusCode(), filtered.build(), body));
             });
 
         CompletableFuture<Void> bodyDone = new CompletableFuture<>();
@@ -92,8 +99,10 @@ public final class VertxUpstreamClient implements UpstreamClient {
     }
 
     private void copyRequestHeaders(GatewayHeaders headers, HttpClientRequest target) {
+        Set<String> skip = HopByHopHeaders.namesFor(headers);
+        log.debug("[upstream] forwarding headers: {} (skipping hop-by-hop: {})", headers.asMap().keySet(), skip);
         headers.asMap().forEach((name, values) -> {
-            if (!SKIP_REQUEST_HEADERS.contains(name.toLowerCase())) {
+            if (!skip.contains(name.toLowerCase())) {
                 values.forEach(value -> target.putHeader(name, value));
             }
         });

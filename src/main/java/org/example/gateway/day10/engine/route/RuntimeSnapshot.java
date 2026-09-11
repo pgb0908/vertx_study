@@ -1,4 +1,4 @@
-package org.example.gateway.day10.engine;
+package org.example.gateway.day10.engine.route;
 
 /**
  * 요청 처리 시점에 사용하는, 이미 컴파일된 불변 런타임 구성 (feedback 13절).

@@ -1,6 +1,8 @@
-package org.example.gateway.day10.domain.upstream;
+package org.example.gateway.day10.domain.upstream.balance;
 
 import org.example.gateway.day10.domain.model.GatewayExchange;
+import org.example.gateway.day10.domain.upstream.EgressGroup;
+import org.example.gateway.day10.domain.upstream.Endpoint;
 
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;

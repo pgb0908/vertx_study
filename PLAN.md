@@ -102,8 +102,9 @@ PoC를 넘어 실무에서 쓸 수 있는 구조로 한 단계 더 진행했다.
   config와 runtime state를 분리하기 위해서(feedback 12절).
 - **UpstreamExecutor + Retry/CircuitBreaker/Timeout 인터페이스** — 재시도/회로
   차단/타임아웃을 Filter가 아니라 업스트림 호출을 감싸는 별도 execution
-  policy로 분리했다. v1은 `RetryPolicy.none()`/`CircuitBreaker.disabled()`/
-  `TimeoutPolicy.none()` no-op 구현만 있다 — 실제 Vert.x 래핑 구현체는 2차 항목 1.
+  policy로 분리했다. 이 시점엔 `RetryPolicy.none()`/`CircuitBreaker.disabled()`/
+  `TimeoutPolicy.none()` no-op 구현만 있었다 — 실제 Vert.x 래핑 구현체는 바로
+  다음 절("실무 관점 상위 6개 보완")에서 채웠다.
 - **RuntimeSnapshot / RouteTable** — 요청 처리 시점에는 이미 컴파일된
   `RuntimeSnapshot`만 참조한다. v1은 부팅 시 한 번만 만들고 교체하지 않는다 —
   config 파일 로딩 + 원자적 스왑은 2차 항목 5.
@@ -123,25 +124,150 @@ onComplete를 미룬다"는 상태 구분(`AWAITING_UPSTREAM` vs `PROCESSING`)�
 빠져 있었던 것. `FilterChainBodySubscriberTest`에 순서 보장 + 빈 바디 회귀
 테스트를 추가했다.
 
-### 다음 할 일 (2차)
+### 실무 관점 상위 6개 보완 (코드 리뷰 → 우선순위 1~6번 적용)
 
-1. **CircuitBreaker 실제 구현** — `domain.upstream.CircuitBreaker` 인터페이스는
-   이미 있음. `runtime.vertx`에서 `io.vertx.circuitbreaker.CircuitBreaker`를
-   래핑하는 구현체를 만들고 curl로 open/half-open 동작 검증.
-2. **다중 라우트 + RouteMatcher** — `RouteTable`은 지금 정확 일치만 지원.
-   라우트가 2개 이상이 되면 Vert.x `Router`로 매칭을 위임 (day9
-   `GatewayRouterBuilder`와 같은 이유: 매칭 로직 재구현은 실제 배포 동작과
-   괴리될 위험).
-3. **Retry/Timeout 실제 구현** — `RetryPolicy`/`TimeoutPolicy`도 CircuitBreaker와
-   같은 패턴(interface는 domain, 구현은 runtime.vertx 또는 순수 Java 타이머).
-   재시도는 body replay 가능 여부(feedback 6절 — streaming body는 replay 불가)를
-   먼저 판단해야 함.
-4. **JWT / RateLimit Filter** — day9의 `AuthJwtFilter`/`RateLimitFilter`를
-   `Filter`로 재구현 (Vert.x `RoutingContext` 대신 `GatewayExchange` 기반).
-5. **Config 로딩 + hot-reload** — day4~9의 `ConfigWatcher`/`GatewayConfig` 패턴을
-   `RuntimeSnapshot` 원자적 스왑(Arch.md 13절)으로 재적용.
-6. **TLS** — `runtime.vertx`의 `HttpServerOptions.setSsl` 적용, day8과 동일한
-   자체 서명 인증서 재사용.
+day10 코드 리뷰에서 "실무 관점으로 부족한 것"을 11개 순위로 정리했고, 1~6순위를
+적용했다. 조사해보니 상당수가 day7/8/9(`ProxyHandlerFactory`/`proxy.RetryPolicy`/
+`proxy.HopByHopHeaders`/`GatewayRouteResolver`/`Main.java`)에서 이미 검증된
+패턴이었다 — 새로 설계하지 않고 day10의 계층 구조(domain 인터페이스 + runtime.vertx
+구현체)에 맞게 이식했다.
+
+- **Timeout + CircuitBreaker (`VertxCircuitBreaker`)** — `io.vertx.circuitbreaker.
+  CircuitBreaker`를 래핑. `CircuitBreakerOptions.setTimeout`이 곧 타임아웃 구현이라
+  둘이 한 컴포넌트로 해결된다. 5xx도 실패로 취급(day9와 동일 이유 — 안 그러면
+  회로가 절대 안 열림).
+- **Retry (`VertxRetryPolicy`)** — 멱등 메서드(GET/HEAD/OPTIONS)만 재시도 예산을
+  받고, 재시도 대상은 처음부터 `GatewayBody.EMPTY`로 보낸다(day10의 요청 바디는
+  `Flow.Publisher`라 한 번만 구독 가능 — `VertxReadStreamPublisher`가 두 번째
+  구독을 거부하는 걸 확인함). `OpenCircuitException`이면 예산이 남아도 중단.
+- **합성 순서 정정** — `UpstreamExecutor`는 CircuitBreaker가 가장 바깥인 줄
+  알았는데, day9 `ProxyHandlerFactory.attempt()`를 보니 실제로는 **Retry가
+  가장 바깥(루프)이고 매 시도마다 CircuitBreaker를 다시 태운다** — 안 그러면
+  재시도 루프 전체가 breaker 입장에서 "시도 1번"으로만 집계된다. 순서를
+  Retry→CircuitBreaker→Timeout(no-op)→client로 고쳤다.
+- **Hop-by-hop 헤더 + X-Forwarded-\*/Via (`domain.model.HopByHopHeaders`)** —
+  day9 `proxy.HopByHopHeaders`의 고정 목록을 이식하고, `Connection` 헤더 값이
+  동적으로 추가 지정하는 헤더 이름까지 반영(day9엔 없던 부분). `X-Forwarded-For`
+  (체인이면 콤마로 append)/`-Proto`/`-Host`는 `VertxRequestAdapter`가, `Via`는
+  `VertxUpstreamClient`가 추가 — 둘 다 day9에도 없던 신규 기능.
+- **에러 응답 정제 (`VertxGatewayServer.respondError`)** — `err.getMessage()`를
+  클라이언트에 그대로 노출하던 걸 없애고, day9 `respondError`와 동일한 매핑
+  (`OpenCircuitException`→503+`Retry-After`, `TimeoutException`→504, 그 외→502,
+  본문은 고정 문구만)을 적용. 상세는 로그에만 남긴다.
+- **`GatewayHeaders` 완전 불변화** — record 안에 있으면서도 `add()`가 자기 자신을
+  변경하던 mutable 클래스였다(record는 필드 참조만 불변으로 만들지, 그 참조가
+  가리키는 객체 내부까지 불변으로 만들진 않는다는 함정). `withAdded()`(단건 추가,
+  새 인스턴스)와 `Builder`(여러 건 조립용)로 재작성. mutable이던 지점은 정확히
+  2곳(`VertxRequestAdapter`, `VertxUpstreamClient`의 응답 헤더 빌드)뿐이었다.
+- **Graceful shutdown** — 처음엔 day9 `Main.java`와 똑같이 `vertx.close()`만
+  걸었는데, **실제로 curl로 검증해보니 in-flight 요청이 응답 없이 그냥 끊겼다**
+  (`HttpServer.close()`의 Vert.x javadoc이 "Any open HTTP connections will be
+  closed"라고 명시 — 확인함). day9는 애초에 "이건 시작점일 뿐" 이라고 정직하게
+  범위를 한정했었는데, 사용자가 원래 지적한 문제("처리 중이던 요청이 그냥
+  끊깁니다")를 실제로 고치려면 진짜 draining이 필요했다. `VertxGatewayServer`에
+  in-flight 카운터를 추가하고, `stop(drainTimeoutMs)`가 **카운트가 0이 될 때까지
+  먼저 기다린 뒤에** `HttpServer.close()`를 부르도록 순서를 뒤집었다(먼저 닫으면
+  draining이 무의미해짐 — 실제로 겪고 고침). SIGTERM 중 2초 지연 응답을 기다리는
+  요청이 끝까지 200으로 완료되는 걸 curl로 확인했다. 다만 draining 도중 새 연결을
+  거부하지는 못한다(Vert.x에 그런 API가 없음) — 실제 배포에선 로드밸런서가 먼저
+  라우팅을 끊어준다는 전제.
+- **검증 중 발견해서 같이 고친 버그 2개**:
+  1. `RouteTable.match()`가 쿼리스트링까지 포함한 전체 URI로 라우트를 비교하고
+     있었다 — `?delayMs=1000` 같은 쿼리파라미터가 붙으면 무조건 404. 매칭 전에
+     `?` 이후를 잘라내도록 고침(`GatewayEngineTest`에 회귀 테스트 추가).
+  2. `timeoutMs`를 day7/8/9와 같은 500ms로 재사용하려 했다가, **5MB 업로드가
+     정상적으로도 약 1.2초 걸린다는 걸 실측**하고 타임아웃과 충돌한다는 걸
+     발견했다 — day9는 resilience 라우트에서 요청 바디를 항상 버퍼링/비움
+     처리해서 이 문제가 없었지만, day10은 항상 스트리밍이라 그대로 재사용하면
+     안 됐다. `timeoutMs=5000`으로 올려서 대용량 업로드는 통과시키면서 진짜
+     멈춘 백엔드는 여전히 잡아내도록 조정.
+- 신규 테스트: `VertxRetryPolicyTest`(순수 JUnit, 멱등/비멱등/OpenCircuitException
+  중단 검증), `VertxCircuitBreakerTest`(실제 `Vertx.vertx()` 인스턴스로 open/
+  timeout/5xx-as-failure 검증 — 소켓 통신 없이 가능해서 curl 대신 JUnit으로 커버).
+  `day10/TESTING.md`에 회로차단기/타임아웃/재시도/에러정제/hop-by-hop/graceful
+  shutdown curl 시나리오 전부 추가.
+
+### 파일 기반 config 로딩 (`doc/*.md` 스펙 적용)
+
+`day10/doc/`에 Listener/Connector/Router/Policy_auth_apikey 4개 리소스 스펙이
+K8s CRD 스타일(`apiVersion`/`kind`/`metadata`/`spec`, 리소스 간 `*Ref`로 상호
+참조)로 정의돼 있었고, 이번에 그 중 **Listener + Connector + Router**를 실제로
+읽어서 부팅하도록 만들었다(Policy_auth_apikey는 다음 단계 — 실제 ApiKey 인증
+Filter가 아직 없어서). `config` 신규 패키지(`ConfigLoader`/`RuntimeSnapshotCompiler`
+/ 리소스별 record)가 Arch.md 12/13절의 "Config World → compile → Runtime World"
+경계를 구현한다.
+
+- **파일 레이아웃**: 리소스당 파일 1개, kind별 디렉토리(`config/day10/listeners/`,
+  `connectors/`, `routers/`) — K8s manifest 관례. `-Dgateway.configDir`로 위치
+  변경 가능(기본 `config/day10`). hot-reload는 없음 — 부팅 시 1회만 읽는다.
+- **Router → 여러 Connector 가중치 분산** (Router.md 예시1: 90/10) — Connector
+  내부 endpoint 선택(`LoadBalancer`)과는 별개의 레이어라서, `engine.RuntimeConnector`
+  (Connector 하나 = endpoint pool + 그 Connector 전용 Retry/CircuitBreaker/Timeout)
+  와 `engine.ConnectorSelector`(여러 Connector 중 가중치로 하나 선택, 정수 누적
+  방식)를 새로 도입했다. 이 때문에 `UpstreamExecutor`가 `GatewayEngine`이 아니라
+  **Connector 단위**로 옮겨갔다(Connector마다 resilience 설정이 다르므로) —
+  `RuntimeRoute`도 `EndpointSelector` 대신 `ConnectorSelector`를 들고 `GatewayRoute`
+  에서 `EgressGroup` 필드 자체를 뺐다(하나의 Route가 여러 Connector를 가리킬 수
+  있어서 "Route 하나 = 목적지 하나" 가정이 깨짐).
+- **`Connector.spec.method`/`proxyPath` = "해석 B"(고정 API 호출 템플릿)** — grill
+  형태로 사용자와 확인: 클라이언트가 실제로 보낸 method/path와 무관하게, 그
+  Connector로 라우팅되면 항상 spec.method + spec.proxyPath로 백엔드를 호출한다
+  (투명 프록시가 아니라 "미리 정의된 API를 대신 호출해주는" 게이트웨이 모델).
+  클라이언트 쿼리스트링은 유지해서 proxyPath 뒤에 그대로 붙인다(`RuntimeConnector`).
+- **실제로 겪은 버그**: Vert.x `HttpClient`에 method=GET으로 청크 바디를 스트리밍
+  했더니 응답이 수 ms 만에 와버리고 클라이언트 업로드가 전혀 진행되지 않았다
+  (`uploaded=0`). `RuntimeConnector`가 고정 method GET/HEAD일 때 원본 바디를
+  무조건 `GatewayBody.EMPTY`로 바꿔치기하도록 방어 처리해서 해결(day9
+  `VertxRetryPolicy`가 멱등 메서드에 항상 빈 바디를 쓰는 것과 같은 패턴).
+- **재시도 예산도 "실제로 백엔드에 나가는 method" 기준으로 재해석됨** — 부수
+  효과로, `VertxRetryPolicy`가 보는 method는 이제 클라이언트 원본이 아니라
+  `RuntimeConnector`가 고정한 method다. Connector의 method가 POST(비멱등)면
+  클라이언트가 GET을 보냈어도 재시도가 안 된다 — 재시도 안전성은 실제로 재전송될
+  요청이 무엇인지에 달려 있으므로 오히려 더 정확한 동작.
+- **검증 범위 결정**(전부 사용자와 확인): RouteMatcher는 여전히 path+method 정확
+  일치만, resilience 필드는 richer한 스펙(retryOn/backoff/perTryTimeout 등)을
+  기존 단순 구현(maxFailures/timeoutMs/resetTimeoutMs/maxRetries)에 매핑만 하고
+  반영 안 함, LoadBalancer는 ROUND_ROBIN만 실제 구현(다른 값이면 부팅 실패),
+  healthCheck/바디 크기 제한/TLS는 파싱조차 안 함, Listener는 1개만 지원.
+  전부 스펙과 다르면 조용히 폴백하지 않고 `GatewayConfigException`으로 부팅을
+  막는다.
+- 신규 파일: `config/{ListenerConfig,ConnectorConfig,ConnectorTarget,
+  LoadBalancingConfig,ResilienceSettings,RouterConfig,RouterDestination,
+  GatewayConfig,GatewayConfigException,ConfigLoader,RuntimeSnapshotCompiler}`,
+  `engine/{RuntimeConnector,ConnectorSelector}`(신규), `engine/EndpointSelector`
+  삭제(RuntimeConnector로 흡수).
+- 신규 테스트: `ConfigLoaderTest`(실제 `config/day10` 예시 로딩+컴파일, 스펙 위반
+  케이스별 거부 확인), `RuntimeConnectorTest`(고정 method/proxyPath 재작성,
+  쿼리스트링 유지, GET/HEAD 빈 바디 방어), `ConnectorSelectorTest`(단일 목적지/
+  가중치 분산 확률적 검증). `Main.java`가 `config/day10/*`을 읽어 기존 `/echo`
+  curl 시나리오(GET+POST 5MB 스트리밍 포함)가 전부 그대로 통과하는 걸 재확인
+  (`day10/TESTING.md`).
+
+### 다음 할 일 (2차, 남은 것)
+
+1. **다중 라우트 prefix/wildcard 매칭** — `RouteTable`은 지금 path+method 정확
+   일치만 지원. Router가 많아지고 prefix 매칭이 필요해지면 Vert.x `Router`로
+   매칭을 위임 (day9 `GatewayRouterBuilder`와 같은 이유: 매칭 로직 재구현은
+   실제 배포 동작과 괴리될 위험).
+2. **JWT / RateLimit Filter + Policy 리소스 연동** — day9의 `AuthJwtFilter`/
+   `RateLimitFilter`를 `Filter`로 재구현하고, `Policy_auth_apikey` 등 Policy
+   리소스를 파싱해서 `RuntimeSnapshotCompiler`가 해당 Router에 실제로 붙이도록
+   연결 (지금은 모든 Router에 `LoggingFilter`만 기본으로 붙음).
+3. **Config hot-reload** — day4~9의 `ConfigWatcher` 패턴으로 파일 변경 감지 +
+   `RuntimeSnapshot` 원자적 스왑(Arch.md 13절). 지금은 부팅 시 1회만 읽음.
+4. **TLS** — `runtime.vertx`의 `HttpServerOptions.setSsl` 적용, day8과 동일한
+   자체 서명 인증서 재사용. `Listener.spec.tls`/`Connector.spec.upstreamTls`도
+   이때 같이 파싱하도록.
+5. **HttpClient 커넥션 옵션** — `vertx.createHttpClient()`가 기본 옵션 그대로다
+   (풀 크기/idle timeout/connect timeout 미설정).
+6. **관측성(메트릭)** — 로그만 있고 Micrometer/Prometheus 연동 없음.
+7. **richer resilience 매핑** — `retry.retryOn`/`retryBackoff`/`perTryTimeout`,
+   `timeout.connect`/`timeout.send`를 실제로 반영하려면 `VertxRetryPolicy`/
+   `VertxCircuitBreaker` 자체를 확장해야 함(지금은 단순 매핑만).
+8. **LoadBalancer 알고리즘 추가** — LEAST_CONN/IP_HASH/RANDOM (지금은 ROUND_ROBIN만).
+9. **healthCheck 능동 헬스체크, maxRequestBodySize/maxResponseBodySize 강제,
+   다중 Listener 지원** — 전부 파싱조차 안 하거나(healthCheck/바디크기) 1개로
+   제한(Listener)된 상태.
 
 각 항목이 끝날 때마다 `day10/TESTING.md`에 시나리오를 추가하고, engine 쪽
 로직이 늘어나면 `GatewayEngineTest`에 순수 unit test를 먼저 추가한다

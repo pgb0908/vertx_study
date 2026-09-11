@@ -1,7 +1,9 @@
-package org.example.gateway.day10.domain.upstream;
+package org.example.gateway.day10.domain.upstream.resilience;
 
 import org.example.gateway.day10.domain.model.GatewayRequest;
 import org.example.gateway.day10.domain.model.GatewayResponse;
+import org.example.gateway.day10.domain.upstream.Endpoint;
+import org.example.gateway.day10.domain.upstream.UpstreamClient;
 
 import java.util.concurrent.CompletableFuture;
 

@@ -1,0 +1,32 @@
+{
+  "apiVersion": "iip.gateway/v1alpha1",
+  "kind": "Router",
+  "uid": "echo-post-router-uid",
+  "workspaceId": "dev",
+  "id": "echo-post-router",
+  "name": "echo-post-router",
+  "version": "v1",
+  "description": "POST /echo -> echo-connector (5MB 스트리밍 업로드 테스트용)",
+  "metadata": {
+    "name": "echo-post-router"
+  },
+  "spec": {
+    "rule": {
+      "protocol": "HTTP",
+      "match": {
+        "path": "/echo",
+        "methods": "POST"
+      }
+    },
+    "destinations": [
+      {
+        "destinationRef": {
+          "kind": "Connector",
+          "uid": "echo-connector-uid",
+          "id": "echo-connector",
+          "name": "echo-connector"
+        }
+      }
+    ]
+  }
+}

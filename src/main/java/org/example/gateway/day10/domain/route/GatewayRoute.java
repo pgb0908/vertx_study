@@ -1,15 +1,14 @@
 package org.example.gateway.day10.domain.route;
 
 import org.example.gateway.day10.domain.filter.Filter;
-import org.example.gateway.day10.domain.upstream.EgressGroup;
 
 import java.util.List;
 
 /**
- * 라우트 설정(config). path가 매칭되면 어떤 EgressGroup으로 보내고 어떤
- * Filter를 거칠지를 정의한다 — 이 자체는 아직 "실행 가능한" 형태가 아니다.
- * FilterChain으로 컴파일되고 EndpointSelector가 붙은 실행 가능 형태는
- * engine.RuntimeRoute (feedback 7/12절: Config World → compile → Runtime World).
+ * 라우트 설정(config) — Router.md의 spec.rule.match(path+method)에 대응한다.
+ * 목적지(Connector) 정보는 여기 없다 — 하나의 Router가 여러 Connector에 가중치로
+ * 분산될 수 있어서(Router.md 예시1) "라우트 하나 = 목적지 하나"라는 이전 가정이
+ * 깨졌다. 목적지 선택은 engine.ConnectorSelector가 컴파일 시점에 담당한다.
  */
-public record GatewayRoute(String path, EgressGroup egressGroup, List<Filter> filters) {
+public record GatewayRoute(String path, String method, List<Filter> filters) {
 }
